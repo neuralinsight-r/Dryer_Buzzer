@@ -119,7 +119,7 @@ The startup self-test log line provides a resting baseline to compare against du
 
 See [test_cases.md](./test_cases.md) for the complete end-to-end validation matrix covering boundary testing, state transitions, and error injection.
 
-A pytest suite is also available in `test_dryer_buzzer.py`. All hardware dependencies are mocked, so the suite runs on any machine without a Raspberry Pi attached:
+A pytest suite is also available in `test_dryer_monitor.py`. All hardware dependencies are mocked, so the suite runs on any machine without a Raspberry Pi attached:
 
 ```bash
 pip install pytest
