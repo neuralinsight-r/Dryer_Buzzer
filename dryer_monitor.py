@@ -30,6 +30,7 @@ STOP_DELAY         = 120      # 2 minutes
 
 WATCHDOG_INTERVAL          = 60    # seconds between watchdog checks
 STUCK_STARTING_THRESHOLD   = START_DELAY * 3   # 15 min
+STUCK_RUNNING_THRESHOLD = 60 * 120  # 120 minutes
 STUCK_WAITING_THRESHOLD    = STOP_DELAY  * 5   # 10 min
 
 LOG_PATH           = 'dryer.log'
@@ -157,6 +158,9 @@ def watchdog_check():
     if state == "STARTING" and start_time and (now - start_time) > STUCK_STARTING_THRESHOLD:
         log_accel("WARNING - Stuck in STARTING for 15+ min.")
 
+    if state == "RUNNING" and start_time and (now - start_time) > STUCK_RUNNING_THRESHOLD:
+        log_accel("WARNING - Dryer has been RUNNING for 120+ min. Possible sensor issue or unusually long cycle.")
+    
     if state == "WAITING_TO_STOP" and stop_time and (now - stop_time) > STUCK_WAITING_THRESHOLD:
         log_accel("WARNING - Stuck in WAITING_TO_STOP for 10+ min.")
 
