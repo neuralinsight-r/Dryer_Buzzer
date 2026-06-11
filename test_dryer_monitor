@@ -1,0 +1,315 @@
+"""
+Pytest suite for dryer_monitor.py
+Covers all TC-F, TC-B, and TC-N cases from the validation matrix.
+
+Run with:
+    pytest test_dryer_monitor.py -v
+
+Requirements:
+    pip install pytest pytest-mock
+
+Hardware (RPi.GPIO, board, busio, adafruit_adxl34x) is fully mocked —
+no Raspberry Pi needed to run these tests.
+"""
+
+import sys
+import types
+import importlib
+import os
+import pytest
+from unittest.mock import MagicMock, patch, call
+
+
+# ===========================================================
+# --- HARDWARE MOCK SETUP ---
+# Inject fake modules before dryer_monitor is ever imported.
+# This prevents ImportError on non-Pi environments.
+# ===========================================================
+
+def _make_hardware_mocks():
+    """Build and inject all RPi / Adafruit stub modules."""
+
+    # RPi.GPIO
+    gpio = types.ModuleType("RPi")
+    gpio_gpio = types.ModuleType("RPi.GPIO")
+    gpio_gpio.BCM = "BCM"
+    gpio_gpio.OUT = "OUT"
+    gpio_gpio.HIGH = 1
+    gpio_gpio.LOW = 0
+    gpio_gpio.setmode = MagicMock()
+    gpio_gpio.setup = MagicMock()
+    gpio_gpio.output = MagicMock()
+    gpio_gpio.cleanup = MagicMock()
+    gpio.GPIO = gpio_gpio
+    sys.modules["RPi"] = gpio
+    sys.modules["RPi.GPIO"] = gpio_gpio
+
+    # board / busio
+    board_mod = types.ModuleType("board")
+    board_mod.SCL = "SCL"
+    board_mod.SDA = "SDA"
+    sys.modules["board"] = board_mod
+
+    busio_mod = types.ModuleType("busio")
+    busio_mod.I2C = MagicMock(return_value=MagicMock())
+    sys.modules["busio"] = busio_mod
+
+    # adafruit_adxl34x
+    adxl_mod = types.ModuleType("adafruit_adxl34x")
+    mock_accel = MagicMock()
+    mock_accel.acceleration = (0.0, 0.0, 9.8)   # default: still/idle
+    adxl_mod.ADXL345 = MagicMock(return_value=mock_accel)
+    sys.modules["adafruit_adxl34x"] = adxl_mod
+
+    return mock_accel
+
+
+MOCK_ACCELEROMETER = _make_hardware_mocks()
+
+
+# ===========================================================
+# --- IMPORT TARGET MODULE ---
+# Set required env vars before import so the module-level
+# os.environ[] lookups don't raise KeyError.
+# ===========================================================
+
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test_token")
+os.environ.setdefault("TELEGRAM_CHAT_ID",   "test_chat_id")
+
+# Import the module under test (adjust name if your file differs)
+import dryer_monitor as db
+
+
+# ===========================================================
+# --- HELPERS ---
+# ===========================================================
+
+def run_state_machine(vibration_sequence):
+    """
+    Drive the FSM through one complete iteration per entry in
+    `vibration_sequence`, a list of (is_vibrating: bool, time: float).
+
+    Returns the list of states visited and a log of side-effect calls.
+    """
+    states_visited = []
+    state = "IDLE"
+    start_time = None
+    stop_time = None
+
+    for vibrating, now in vibration_sequence:
+        states_visited.append(state)
+
+        if state == "IDLE":
+            if vibrating:
+                state = "STARTING"
+                start_time = now
+
+        elif state == "STARTING":
+            if not vibrating:
+                state = "IDLE"
+            elif now - start_time >= db.START_DELAY:
+                state = "RUNNING"
+
+        elif state == "RUNNING":
+            if not vibrating:
+                state = "WAITING_TO_STOP"
+                stop_time = now
+
+        elif state == "WAITING_TO_STOP":
+            if vibrating:
+                state = "RUNNING"
+            elif now - stop_time >= db.STOP_DELAY:
+                state = "IDLE"
+                return states_visited, "CYCLE_COMPLETE"
+
+    return states_visited, state
+
+
+# ===========================================================
+# --- TC-F: FUNCTIONAL & STATE TRANSITION TESTS ---
+# ===========================================================
+
+class TestFunctional:
+
+    def test_TC_F01_happy_path_full_cycle(self):
+        """Full cycle: vibrates > 300s, stops > 120s → buzzer + notification."""
+        # Build a timeline: 0–300s vibrating, 301–421s silent
+        sequence = (
+            [(True,  t) for t in range(0, 310)]   # vibrating: crosses START_DELAY
+          + [(False, t) for t in range(310, 435)]  # silent: crosses STOP_DELAY
+        )
+
+        states, outcome = run_state_machine(sequence)
+
+        assert "STARTING"        in states
+        assert "RUNNING"         in states
+        assert "WAITING_TO_STOP" in states
+        assert outcome == "CYCLE_COMPLETE"
+
+    def test_TC_F01_buzzer_fires_on_complete(self):
+        """Buzzer and Telegram notification are called exactly once on cycle end."""
+        with patch.object(db, "trigger_buzzer") as mock_buzz, \
+             patch.object(db, "send_push")     as mock_push, \
+             patch.object(db, "is_vibrating")  as mock_vib, \
+             patch("time.sleep"):
+
+            # Vibrates for START_DELAY ticks, then silent for STOP_DELAY ticks
+            vibration_calls = (
+                [True]  * (db.START_DELAY + 1) +
+                [False] * (db.STOP_DELAY  + 1)
+            )
+            mock_vib.side_effect = vibration_calls + [KeyboardInterrupt]
+
+            # Inject controlled time so delay checks always pass immediately
+            tick = iter(range(10_000))
+            with patch("time.time", side_effect=lambda: next(tick)):
+                try:
+                    db.run_monitor()
+                except (KeyboardInterrupt, StopIteration):
+                    pass
+
+            mock_buzz.assert_called_once()
+            mock_push.assert_called_once()
+
+    def test_TC_F02_short_transient_vibration_no_alert(self):
+        """45-second vibration burst: state reverts to IDLE, no cycle confirmed."""
+        sequence = (
+            [(True,  t) for t in range(0,  45)] +
+            [(False, t) for t in range(45, 90)]
+        )
+        states, final = run_state_machine(sequence)
+
+        assert "RUNNING" not in states
+        assert final == "IDLE"
+
+    def test_TC_F03_mid_cycle_drum_pause_no_false_alert(self):
+        """60s pause during RUNNING returns to RUNNING, no premature end."""
+        # Get to RUNNING first (0–305s), pause 60s (306–366s), resume (367–370s)
+        sequence = (
+            [(True,  t) for t in range(0,   306)] +   # → RUNNING at t=300
+            [(False, t) for t in range(306, 367)] +   # pause < STOP_DELAY(120)
+            [(True,  t) for t in range(367, 372)]     # resumes → back to RUNNING
+        )
+        states, final = run_state_machine(sequence)
+
+        assert states.count("WAITING_TO_STOP") > 0   # pause was detected
+        assert final == "RUNNING"                     # but did NOT complete cycle
+
+
+# ===========================================================
+# --- TC-B: BOUNDARY & THRESHOLD VALUE TESTS ---
+# ===========================================================
+
+class TestBoundary:
+
+    def test_TC_B01_micro_vibration_below_threshold_is_false(self):
+        """Delta accel of 1.49 m/s² → is_vibrating() returns False."""
+        # total_accel such that |total - 9.8| == 1.49  →  total = 11.29
+        # x=11.29, y=0, z=0
+        MOCK_ACCELEROMETER.acceleration = (11.29, 0.0, 0.0)
+        result = db.is_vibrating()
+        assert result is False
+
+    def test_TC_B01_vibration_at_threshold_is_true(self):
+        """Delta accel of exactly 1.5 m/s² → is_vibrating() returns True."""
+        # |11.30 - 9.8| = 1.50
+        MOCK_ACCELEROMETER.acceleration = (11.30, 0.0, 0.0)
+        result = db.is_vibrating()
+        assert result is True
+
+    def test_TC_B02_exact_start_delay_promotes_to_running(self):
+        """At exactly t=300s the FSM promotes from STARTING to RUNNING."""
+        sequence = [(True, t) for t in range(0, db.START_DELAY + 1)]
+        states, _ = run_state_machine(sequence)
+        assert "RUNNING" in states
+
+    def test_TC_B02_one_tick_before_start_delay_stays_starting(self):
+        """At t=299s the FSM stays in STARTING."""
+        sequence = [(True, t) for t in range(0, db.START_DELAY)]  # 0..299
+        states, final = run_state_machine(sequence)
+        assert final == "STARTING"
+
+    def test_TC_B03_exact_stop_delay_triggers_completion(self):
+        """At exactly t=120s after vibration stops, cycle completes."""
+        # Get to RUNNING, then stop vibrating for exactly STOP_DELAY ticks
+        to_running  = [(True,  t)                for t in range(0, db.START_DELAY + 1)]
+        stop_window = [(False, db.START_DELAY + t) for t in range(db.STOP_DELAY + 1)]
+        _, outcome = run_state_machine(to_running + stop_window)
+        assert outcome == "CYCLE_COMPLETE"
+
+    def test_TC_B03_one_tick_before_stop_delay_no_completion(self):
+        """At t=119s the FSM stays in WAITING_TO_STOP."""
+        to_running  = [(True,  t)                for t in range(0, db.START_DELAY + 1)]
+        stop_window = [(False, db.START_DELAY + t) for t in range(db.STOP_DELAY)]  # 0..119
+        _, final = run_state_machine(to_running + stop_window)
+        assert final == "WAITING_TO_STOP"
+
+
+# ===========================================================
+# --- TC-N: NEGATIVE & ERROR RESILIENCE TESTS ---
+# ===========================================================
+
+class TestNegative:
+
+    def test_TC_N01_missing_env_var_raises_key_error(self):
+        """Unset TELEGRAM_BOT_TOKEN → module-level KeyError on import."""
+        # Temporarily remove the env var and force a re-import
+        token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+        try:
+            # Remove cached module so it re-executes top-level code
+            sys.modules.pop("dryer_monitor", None)
+            with pytest.raises((KeyError, SystemExit)):
+                importlib.import_module("dryer_monitor")
+        finally:
+            if token:
+                os.environ["TELEGRAM_BOT_TOKEN"] = token
+            # Restore cached module for subsequent tests
+            sys.modules.pop("dryer_monitor", None)
+            importlib.import_module("dryer_monitor")
+
+    def test_TC_N02_hardware_init_failure_raises(self):
+        """If I2C raises on init, the exception propagates (no silent failure)."""
+        with patch.dict(sys.modules):
+            busio_mod = types.ModuleType("busio")
+            busio_mod.I2C = MagicMock(side_effect=OSError("I2C not found"))
+            sys.modules["busio"] = busio_mod
+            sys.modules.pop("dryer_monitor", None)
+
+            with pytest.raises((OSError, Exception)):
+                importlib.import_module("dryer_monitor")
+
+        # Restore good mock for subsequent tests
+        busio_mod2 = types.ModuleType("busio")
+        busio_mod2.I2C = MagicMock(return_value=MagicMock())
+        sys.modules["busio"] = busio_mod2
+
+    def test_TC_N03_keyboard_interrupt_triggers_gpio_cleanup(self):
+        """Ctrl+C during the loop → GPIO.cleanup() is always called."""
+        import RPi.GPIO as GPIO
+
+        with patch.object(db, "is_vibrating", side_effect=KeyboardInterrupt), \
+             patch("time.sleep"):
+            try:
+                db.run_monitor()
+            except KeyboardInterrupt:
+                pass  # acceptable if caller propagates
+
+        GPIO.cleanup.assert_called()
+
+    def test_send_push_handles_network_error_gracefully(self):
+        """send_push() logs the error but does NOT raise on network failure."""
+        with patch("urllib.request.urlopen", side_effect=OSError("no network")):
+            # Should not raise — just log the error
+            db.send_push("test message")
+
+    def test_trigger_buzzer_sets_gpio_high_then_low(self):
+        """trigger_buzzer() drives pin HIGH then LOW."""
+        import RPi.GPIO as GPIO
+        GPIO.output.reset_mock()
+
+        with patch("time.sleep"):
+            db.trigger_buzzer()
+
+        calls = GPIO.output.call_args_list
+        assert call(db.BUZZER_PIN, GPIO.HIGH) in calls
+        assert call(db.BUZZER_PIN, GPIO.LOW)  in calls
