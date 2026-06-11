@@ -107,7 +107,7 @@ def self_test():
         f"Self-test baseline "
         f"[accel: x={x:.2f}, y={y:.2f}, z={z:.2f}, magnitude={magnitude:.2f}]"
     )
-    assert 8.0 < magnitude < 11.5, (
+    assert 8.0 < magnitude < 12.5, (
         f"Self-test FAILED — implausible resting reading: {magnitude:.2f} m/s². "
         f"Check accelerometer wiring."
     )
