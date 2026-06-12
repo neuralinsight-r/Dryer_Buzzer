@@ -145,7 +145,11 @@ def trigger_buzzer():
 def is_vibrating():
     x, y, z   = accelerometer.acceleration
     magnitude = (x**2 + y**2 + z**2)**0.5
-    return abs(magnitude - 9.8) > VIBRATION_THRESHOLD
+    # Ignore physically implausible readings (loose connection artifact)
+    if magnitude < 1.0:
+        return False
+    delta = abs(magnitude - 9.8)
+    return delta > VIBRATION_THRESHOLD
 
 
 def watchdog_check():
